@@ -14,6 +14,7 @@ using System.Linq;
 using System.Diagnostics;
 using System.Net.Sockets;
 using System.Text.Json;
+using ClientWebSocket = System.Net.WebSockets.Managed.ClientWebSocket;
 
 namespace IflySdk
 {
@@ -29,6 +30,7 @@ namespace IflySdk
         private readonly List<ResultWPGSInfo> _result = new List<ResultWPGSInfo>();
         private readonly static object _cacheLocker = new object();
         private Task _receiveTask = null;
+        private bool _firstRunning = true;
 
         /// <summary>
         /// 错误
@@ -138,6 +140,7 @@ namespace IflySdk
                 {
                     result.Append(item.data);
                 }
+                Status = ServiceStatus.Stopping;
                 ResetState();
                 return new ResultModel<string>()
                 {
@@ -161,17 +164,20 @@ namespace IflySdk
         /// <param name="data"></param>
         public void Convert(byte[] data, bool isEnd = false)
         {
-            if (Status == ServiceStatus.Stopped)
+            if (Status == ServiceStatus.Stopping && data != null)
+                return;
+            if (isEnd)
+                Status = ServiceStatus.Stopping;
+
+            if (_firstRunning || Status == ServiceStatus.InnerStop)
             {
                 Status = ServiceStatus.Running;
+                _firstRunning = false;
                 Task.Run(() => StartConvert());
             }
-            if (Status == ServiceStatus.Running)
+            if (Status == ServiceStatus.Running
+                || Status == ServiceStatus.Stopping)
             {
-                if (isEnd)
-                {
-                    Status = ServiceStatus.Stopping;
-                }
                 lock (_cacheLocker)
                 {
                     _cache.Enqueue(new CacheBuffer()
@@ -194,10 +200,11 @@ namespace IflySdk
             {
                 if (Status != ServiceStatus.Stopped)
                 {
+                    Status = ServiceStatus.Stopping;
                     Convert(null, true);
                     while (Status != ServiceStatus.Stopped)
                     {
-                        Thread.Sleep(10);
+                        Thread.Sleep(5);
                     }
                 }
                 return true;
@@ -231,7 +238,7 @@ namespace IflySdk
                 int connectOutTime = 60;
                 int sendDataOutTime = 8;
 
-                while (Status != ServiceStatus.Stopped)
+                while (Status == ServiceStatus.Running)
                 {
                     CacheBuffer data = null;
 
@@ -280,7 +287,7 @@ namespace IflySdk
                     {
                         OnError?.Invoke(this, new ErrorEventArgs()
                         {
-                            Code = ResultCode.Warning,
+                            Code = ResultCode.Disconnect,
                             Message = fragmentResult.Message,
                             Exception = new Exception(fragmentResult.Message),
                         });
@@ -458,7 +465,9 @@ namespace IflySdk
             catch (Exception ex)
             {
                 //服务器主动断开连接或者自动断开连接了
-                if (ex.Message.ToLower().Contains("unable to read data from the transport connection"))
+                string errorMsg = ex.Message.ToLower();
+                if (errorMsg.Contains("unable to read data from the transport connection")
+                    || errorMsg.Contains("the remote party closed the websocket connection"))
                 {
                     try
                     {
@@ -492,6 +501,10 @@ namespace IflySdk
             {
                 _result.Clear();
             }
+
+            //单次完整数据
+            string msg = "";
+
             while (true)
             {
                 try
@@ -512,11 +525,24 @@ namespace IflySdk
                             continue;
                         }
 
-                        string msg = Encoding.UTF8.GetString(array, 0, receive.Count);
+                        //string msg = Encoding.UTF8.GetString(array, 0, receive.Count);
+                        //在Winform中无法把json一次完整接收，需要判断EndOfMessage的状态。
+                        //临时不完整数据
+                        string tempMsg = Encoding.UTF8.GetString(array, 0, receive.Count);
+                        msg += tempMsg;
+                        if (receive.EndOfMessage == false)
+                        {
+                            continue;
+                        }
+
                         ASRResult result = JsonSerializer.Deserialize<ASRResult>(msg, new JsonSerializerOptions()
                         {
                             PropertyNameCaseInsensitive = true
                         });
+
+                        //清空数据
+                        msg = "";
+
                         if (result.Code != 0)
                         {
                             throw new Exception($"Result error({result.Code}): {result.Message}");
@@ -618,7 +644,7 @@ namespace IflySdk
             _receiveTask = null;
             _rest.Clear();
             _result.Clear();
-            Status = ServiceStatus.Stopped;
+            Status = Status == ServiceStatus.Stopping ? ServiceStatus.Stopped : ServiceStatus.InnerStop;
 
             lock (_cacheLocker)
             {
